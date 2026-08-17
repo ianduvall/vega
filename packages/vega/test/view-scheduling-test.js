@@ -1,8 +1,9 @@
 import tape from 'tape';
 import * as vega from '../index.js';
 
-// deterministic scatter plot specification, with enough points that a
-// scheduled run yields many times over the course of its evaluation
+// deterministic scatter plot specification, with enough points that every
+// chunked loop -- item drawing, data join, encoding and bounds -- crosses
+// at least two of its batch boundaries
 function spec() {
   const points = [];
   for (let i = 0; i < 1500; ++i) {
@@ -259,5 +260,92 @@ tape('View finalize during a pending data load aborts the in-flight run', async 
   } catch (error) {
     t.ok(view._scheduler.didAbort(error), 'rejected with the cancel reason');
   }
+  t.end();
+});
+
+// a modify pass over every tuple, which drives the mod and reflow branches
+// of the encode and bounds transforms rather than just their add branches
+async function modify(view) {
+  const cs = vega.changeset();
+  view.data('table').forEach(d => cs.modify(d, 'v', (d.v + 13) % 91));
+  await view.change('table', cs).runAsync();
+  return view;
+}
+
+function identical(t, b, a, when) {
+  t.deepEqual(b.data('table'), a.data('table'), `identical datasets ${when}`);
+  t.equal(
+    b.scenegraph().toJSON(2),
+    a.scenegraph().toJSON(2),
+    `identical scenegraphs ${when}`
+  );
+  t.ok(
+    b._renderer.canvas().toBuffer().equals(a._renderer.canvas().toBuffer()),
+    `identical rendered canvases ${when}`
+  );
+}
+
+tape('View initialize shares the scheduler with the canvas renderer', async t => {
+  // the scheduler reaches the renderer only through initialize; without that
+  // wiring the renderer silently keeps drawing in one uninterrupted task
+  const scheduled = new vega.View(vega.parse(spec()), {scheduling: true});
+  scheduled.initialize();
+  t.equal(
+    scheduled._renderer._scheduler,
+    scheduled._scheduler,
+    'the canvas renderer shares the view scheduler'
+  );
+
+  const plain = new vega.View(vega.parse(spec()));
+  plain.initialize();
+  t.equal(plain._renderer._scheduler, null, 'no renderer scheduler by default');
+
+  scheduled.finalize();
+  plain.finalize();
+  t.end();
+});
+
+tape('View scheduling produces results identical to synchronous evaluation', async t => {
+  const a = await run(undefined),
+        b = await run(true);
+
+  t.equal(a._scheduler, null, 'scheduling disabled by default');
+  t.ok(b._scheduler, 'scheduling enabled');
+
+  identical(t, b, a, 'after the initial run');
+
+  // chunked evaluation must also agree once tuples are modified in place;
+  // the modify pass is only worth comparing if it actually moves the marks
+  const before = b.scenegraph().toJSON(2);
+  await modify(a);
+  await modify(b);
+  t.notEqual(b.scenegraph().toJSON(2), before, 'the modify pass changed the scenegraph');
+  identical(t, b, a, 'after a modify pass');
+
+  a.finalize();
+  b.finalize();
+  t.end();
+});
+
+tape('View runAsync after finalize renders a redraw-only run cleanly', async t => {
+  const view = yieldAlways(new vega.View(vega.parse(spec()), {
+          scheduling: true
+        })),
+        errors = captureErrors(view);
+
+  view.initialize(); // headless canvas renderer
+  await view.runAsync();
+
+  view.finalize();
+
+  // dirty marks the scene for re-render without touching any operator, so the
+  // dataflow takes its nothing-to-do early exit and only the render phase runs
+  view.dirty(view.scenegraph().root.items[0]);
+  await view.runAsync();
+
+  // finalize cancels in-flight work; a run started afterwards -- including a
+  // redraw-only run that evaluates no operators -- must not be poisoned by the
+  // latch finalize left armed for the render phase to trip over
+  t.deepEqual(errors, [], 'redraw-only run after finalize logged no error');
   t.end();
 });
